@@ -1,0 +1,107 @@
+package typesafe
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+func TestResponseValidation(t *testing.T) {
+	cases := []struct{ body, path string }{
+		{`not json`, ""}, {`null`, ""}, {`[]`, ""}, {`{}`, "model"},
+		{`{"model":null,"usage":{},"answers":{}}`, "model"},
+		{`{"model":"m","answers":{}}`, "usage"},
+		{`{"model":"m","usage":{}}`, "answers"},
+		{`{"model":"m","usage":{},"answers":null}`, "answers"},
+		{`{"model":"m","usage":{"input_tokens":0.5},"answers":{}}`, "usage.input_tokens"},
+		{`{"model":"m","usage":{},"answers":{"q":null}}`, "answers.q.type"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":7}}}`, "answers.q.type"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"noul"}}}`, "answers.q.noul"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"noul","noul":null}}}`, "answers.q.noul"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"noul","noul":"0.5"}}}`, "answers.q.noul"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"choice","choice":"a","probabilities":{}}}}`, "answers.q.confidence"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"choice","choice":"a","confidence":1,"probabilities":{"a":null}}}}`, "answers.q.probabilities.a"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{"x":"bad"},"probabilities":{}}}}`, "answers.q.legend"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{"0":null},"probabilities":{}}}}`, "answers.q.legend.0"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{},"probabilities":{"x":1}}}}`, "answers.q.probabilities"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.body, func(t *testing.T) {
+			var attempts atomic.Int32
+			client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				w.Header().Set("X-TypeSafe-Request-ID", "req-invalid")
+				fmt.Fprint(w, tc.body)
+			}, WithRetryPolicy(DefaultRetryPolicy()))
+			_, err := client.SystemOne(context.Background(), "x", Questions{"q": Noul{}})
+			var validation *ResponseValidationError
+			if !errors.As(err, &validation) {
+				t.Fatalf("got %T: %v", err, err)
+			}
+			if validation.FieldPath != tc.path || validation.StatusCode != 200 || validation.RequestID != "req-invalid" {
+				t.Fatalf("wrong validation error: %+v", validation)
+			}
+			if attempts.Load() != 1 {
+				t.Error("schema error retried")
+			}
+		})
+	}
+}
+
+func TestForwardCompatibleResponse(t *testing.T) {
+	body := `{"model":"m","extra":true,"usage":{"output_tokens":0,"billing_units":99},"answers":{
+	 "known":{"type":"noul","noul":0,"future":true},"unknown":{"type":"future","value":7},
+	 "score":{"type":"score","score":0,"confidence":1,"legend":{"0":{"examples":["a",{"note":null}]}},"probabilities":{"0":1}}
+	}}`
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, body) })
+	result, err := client.SystemOne(context.Background(), "x", Questions{"q": Noul{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Answers) != 2 || result.Nouls["known"].Noul != 0 {
+		t.Fatal("unknown answer handling failed")
+	}
+	if result.Usage.InputTokens != nil || result.Usage.OutputTokens == nil || *result.Usage.OutputTokens != 0 {
+		t.Fatal("missing and zero token counts conflated")
+	}
+	if result.RequestID != "" || !strings.Contains(string(result.RawBody), `"unknown"`) {
+		t.Fatal("incorrect metadata")
+	}
+	legend := result.Scores["score"].Legend[0].(map[string]any)
+	if len(legend["examples"].([]any)) != 2 {
+		t.Fatal("nested JSON lost")
+	}
+}
+
+func TestModelResponseValidation(t *testing.T) {
+	for _, tc := range []struct{ body, path string }{
+		{`{}`, "models"}, {`{"models":null}`, "models"}, {`{"models":"bad"}`, "models"},
+		{`{"models":[{"name":"m","description":"d"}]}`, "models[0].release_date"},
+	} {
+		var result ListModelsResponse
+		err := json.Unmarshal([]byte(tc.body), &result)
+		var field *fieldError
+		if !errors.As(err, &field) || field.path != tc.path {
+			t.Fatalf("%s: unexpected error %v", tc.body, err)
+		}
+	}
+}
+
+func TestErrorMessageExtraction(t *testing.T) {
+	for _, tc := range []struct{ body, want string }{
+		{`{"error":"one","message":"two"}`, "one"}, {`{"error":{"message":"nested"}}`, "nested"},
+		{`{"message":"message"}`, "message"}, {`{"detail":"detail"}`, "detail"},
+		{`{"detail":{"message":"nested detail"}}`, "nested detail"},
+		{`"plain JSON string"`, "plain JSON string"}, {`plain text`, "plain text"},
+		{`{"detail":[{"loc":["body","q",0],"msg":"bad"},{"msg":"other"}]}`, "q.0: bad; other"},
+	} {
+		if got := errorMessage(decodeErrorBody([]byte(tc.body))); got != tc.want {
+			t.Errorf("%s: got %q want %q", tc.body, got, tc.want)
+		}
+	}
+}
