@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync/atomic"
 	"testing"
 )
@@ -27,6 +28,10 @@ func TestResponseValidation(t *testing.T) {
 		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{"x":"bad"},"probabilities":{}}}}`, "answers.q.legend.x"},
 		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{"0":null},"probabilities":{}}}}`, "answers.q.legend.0"},
 		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{},"probabilities":{"x":1}}}}`, "answers.q.probabilities.x"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{"1":true},"probabilities":{}}}}`, "answers.q.legend.1"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{},"probabilities":{"0":null}}}}`, "answers.q.probabilities.0"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{},"probabilities":{"99999999999999999999":1}}}}`, "answers.q.probabilities.99999999999999999999"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"choice","choice":"a","confidence":1,"probabilities":{"a":[]}}}}`, "answers.q.probabilities.a"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.body, func(t *testing.T) {
@@ -48,6 +53,43 @@ func TestResponseValidation(t *testing.T) {
 				t.Error("schema error retried")
 			}
 		})
+	}
+}
+
+// encoding/json accepts these spellings for integer map keys, so the SDK keeps
+// accepting them; the collisions they create are rejected below.
+func TestScoreIntegerMapKeys(t *testing.T) {
+	body := `{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,` +
+		`"legend":{"0":"low","+1":"high"},"probabilities":{"0":0.5,"+1":0.5}}}}`
+	result, err := decodeSystemOne([]byte(body))
+	if err != nil {
+		t.Fatalf("%s: %v", body, err)
+	}
+	score := result.Scores["q"]
+	if score.Legend[1] != "high" || score.Probabilities[0] != 0.5 || score.Probabilities[1] != 0.5 {
+		t.Fatalf("integer keys lost: %+v", score)
+	}
+}
+
+func TestScoreCollidingMapKeys(t *testing.T) {
+	// "01" and "1" name the same level, and which one survives decoding depends on
+	// map iteration order, so both are reported instead of one being kept.
+	for _, tc := range []struct {
+		body  string
+		paths []string
+	}{
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,` +
+			`"legend":{"01":"low","1":"high"},"probabilities":{}}}}`,
+			[]string{"answers.q.legend.01", "answers.q.legend.1"}},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,` +
+			`"legend":{},"probabilities":{"01":0.5,"1":0.5}}}}`,
+			[]string{"answers.q.probabilities.01", "answers.q.probabilities.1"}},
+	} {
+		_, err := decodeSystemOne([]byte(tc.body))
+		var invalid *ResponseError
+		if !errors.As(err, &invalid) || !slices.Contains(tc.paths, invalid.FieldPath) {
+			t.Fatalf("%s: unexpected error %v", tc.body, err)
+		}
 	}
 }
 

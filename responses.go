@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 type NoulAnswer struct{ Noul float64 }
@@ -118,7 +119,7 @@ func decodeChoice(obj map[string]json.RawMessage, path string) (ChoiceAnswer, er
 	if err != nil {
 		return ChoiceAnswer{}, err
 	}
-	probabilities, err := decodeProbabilities[string](obj, path)
+	probabilities, err := decodeKeyed(obj, "probabilities", path, textKey, probability)
 	if err != nil {
 		return ChoiceAnswer{}, err
 	}
@@ -134,39 +135,88 @@ func decodeScore(obj map[string]json.RawMessage, path string) (ScoreAnswer, erro
 	if err != nil {
 		return ScoreAnswer{}, err
 	}
-	legend, err := required[map[int]any](obj, "legend", path)
+	legend, err := decodeKeyed(obj, "legend", path, levelKey, legendDescription)
 	if err != nil {
 		return ScoreAnswer{}, err
 	}
-	for level, description := range legend {
-		switch description.(type) {
-		case string, map[string]any, []any:
-		default:
-			return ScoreAnswer{}, &ResponseError{FieldPath: fmt.Sprintf("%s.legend.%d", path, level)}
-		}
-	}
-	probabilities, err := decodeProbabilities[int](obj, path)
+	probabilities, err := decodeKeyed(obj, "probabilities", path, levelKey, probability)
 	if err != nil {
 		return ScoreAnswer{}, err
 	}
 	return ScoreAnswer{Score: score, Confidence: confidence, Legend: legend, Probabilities: probabilities}, nil
 }
 
-func decodeProbabilities[K comparable](obj map[string]json.RawMessage, path string) (map[K]float64, error) {
-	raw, err := required[map[K]json.RawMessage](obj, "probabilities", path)
+// decodeKeyed decodes an object field into a map, converting JSON's string keys
+// with key and each member with value. Integer keys are converted here rather
+// than left to encoding/json, because encoding/json only names the offending
+// map key in json.UnmarshalTypeError.Field from Go 1.27 onward and a
+// *ResponseError must name it on every supported Go version.
+func decodeKeyed[K comparable, V any](obj map[string]json.RawMessage, name, path string,
+	key func(string) (K, error), value func(json.RawMessage) (V, error)) (map[K]V, error) {
+	raw, err := required[map[string]json.RawMessage](obj, name, path)
 	if err != nil {
 		return nil, err
 	}
-	result := make(map[K]float64, len(raw))
-	for key, data := range raw {
-		var value float64
-		if err := json.Unmarshal(data, &value); err != nil || isNull(data) {
-			return nil, &ResponseError{FieldPath: fmt.Sprintf("%s.probabilities.%v", path, key), Err: err}
+	result := make(map[K]V, len(raw))
+	for text, data := range raw {
+		field := fmt.Sprintf("%s.%s.%s", path, name, text)
+		converted, err := key(text)
+		if err != nil {
+			return nil, &ResponseError{FieldPath: field, Err: err}
 		}
-		result[key] = value
+		if _, seen := result[converted]; seen {
+			// Distinct JSON keys can name one Go key ("01" and "1"); keeping one of
+			// them would depend on map iteration order.
+			return nil, &ResponseError{FieldPath: field, Err: fmt.Errorf("duplicate key %q", text)}
+		}
+		decoded, err := value(data)
+		if err != nil {
+			return nil, &ResponseError{FieldPath: field, Err: err}
+		}
+		result[converted] = decoded
 	}
 	return result, nil
 }
+
+// textKey and levelKey convert a JSON object key to a map key.
+func textKey(text string) (string, error) { return text, nil }
+
+func levelKey(text string) (int, error) {
+	level, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a score level", text)
+	}
+	return level, nil
+}
+
+// probability and legendDescription reject JSON null, which encoding/json
+// otherwise accepts as a zero value.
+func probability(data json.RawMessage) (float64, error) {
+	var value float64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return 0, err
+	}
+	if isNull(data) {
+		return 0, errNull
+	}
+	return value, nil
+}
+
+func legendDescription(data json.RawMessage) (any, error) {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, err
+	}
+	switch value.(type) {
+	case string, map[string]any, []any:
+		return value, nil
+	case nil:
+		return nil, errNull
+	}
+	return nil, fmt.Errorf("expected a string, object, or array description")
+}
+
+var errNull = errors.New("unexpected null")
 
 func decodeModels(data []byte) (*ListModelsResponse, error) {
 	obj, err := object(data, "")
@@ -231,6 +281,7 @@ func required[T any](obj map[string]json.RawMessage, name, prefix string) (T, er
 		return result, &ResponseError{FieldPath: path}
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
+		// Field names nested struct fields only; decodeKeyed reports map keys.
 		var typeError *json.UnmarshalTypeError
 		if errors.As(err, &typeError) && typeError.Field != "" {
 			path += "." + typeError.Field

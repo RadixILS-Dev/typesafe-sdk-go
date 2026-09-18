@@ -171,6 +171,7 @@ requests and need `TYPESAFE_API_KEY`.
 | Example | Demonstrates |
 | --- | --- |
 | [`examples/basic`](examples/basic/main.go) | One `SystemOne` call with a Noul, Choice, and Score question |
+| [`examples/claims`](examples/claims/main.go) | Many Noul questions in one call over a JSON claim file, cross-checked offline |
 | [`examples/extraction`](examples/extraction/main.go) | Regex candidates plus `Pick` per role, with no-match handling |
 | [`examples/phone`](examples/phone/main.go) | `Pick` and `Classify` over one shared candidate list |
 
@@ -182,8 +183,14 @@ go run ./examples/basic
 The parts that can be checked offline are plain functions with their own tests:
 
 ```sh
-go test ./examples/...   # candidate finders only; no API access
+go test ./examples/...   # offline helpers only; no API access
 ```
+
+`examples/claims` shows the pattern for a batch of related yes/no questions: one
+`SystemOne` call carries the whole claim file, each answer keeps its own
+probability, and the answers that can be computed from the file (dates, amounts,
+coverage flags) are recomputed in Go and compared. Any `DISAGREE` line, and any
+answer missing from the response, is reported rather than defaulted.
 
 Runnable, offline godoc examples, including `*APIError` handling, live in
 [`example_test.go`](example_test.go) and appear on
