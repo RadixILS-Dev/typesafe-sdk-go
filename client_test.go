@@ -127,7 +127,8 @@ func TestLocalFailuresDoNotSend(t *testing.T) {
 	if _, err := client.SystemOne(context.Background(), make(chan int), testQuestions()); err == nil {
 		t.Fatal("unserializable state accepted")
 	}
-	if _, err := client.SystemOne(nil, "state", testQuestions()); err == nil {
+	var noContext context.Context // deliberately nil: the guard must reject it without dialing
+	if _, err := client.SystemOne(noContext, "state", testQuestions()); err == nil {
 		t.Fatal("nil context accepted")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -159,7 +160,7 @@ func TestQuestionValidationBelongsToAPI(t *testing.T) {
 }
 
 func TestHTTPErrorMetadata(t *testing.T) {
-	for _, status := range []int{400, 401, 403, 404, 422, 429, 500, 529, 408, 302} {
+	for _, status := range []int{400, 401, 403, 404, 422, 429, 500, 529, 408, http.StatusFound} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("X-TypeSafe-Request-ID", "req-error")
@@ -193,7 +194,7 @@ func TestRedirectPolicy(t *testing.T) {
 			client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 				attempts.Add(1)
 				if r.URL.Path == "/v1/models" {
-					http.Redirect(w, r, "/redirected", 307)
+					http.Redirect(w, r, "/redirected", http.StatusTemporaryRedirect)
 					return
 				}
 				fmt.Fprint(w, `{"models":[]}`)

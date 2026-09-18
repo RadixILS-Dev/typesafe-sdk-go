@@ -1,11 +1,17 @@
 # TypeSafe AI Go SDK
 
+[![CI](https://github.com/RadixILS-Dev/typesafe-sdk-go/actions/workflows/ci.yml/badge.svg)](https://github.com/RadixILS-Dev/typesafe-sdk-go/actions/workflows/ci.yml)
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/RadixILS-Dev/typesafe-sdk-go.svg)](https://pkg.go.dev/github.com/RadixILS-Dev/typesafe-sdk-go)
+
 A client for [TypeSafe AI](https://typesafe.ai). The wire
 format and default retry behavior follow the
 [Python SDK v0.6.0](https://github.com/typesafe-ai/typesafe-sdk-python/tree/420ef4ffb612d5a539a1e0f0fe883ff6770340af),
 with a smaller, Go-native API.
 
 ## Quick start
+
+Requires Go 1.26 or later. The module declares `go 1.26` as its minimum; CI
+tests that version and the latest stable release.
 
 ```sh
 go get github.com/RadixILS-Dev/typesafe-sdk-go
@@ -150,23 +156,38 @@ use `SystemOne` when batching questions or accessing usage and raw responses.
 
 [`examples/extraction/main.go`](examples/extraction/main.go) finds email addresses
 with a regex, deduplicates them in document order, and uses `Pick` to select the
-receipt destination and From address independently. It also includes phone and
-money patterns usable with the same candidate finder. Normalization stays in
+receipt destination and From address independently. Normalization stays in
 application code, after selection.
-
-```sh
-# Requires TYPESAFE_API_KEY; makes two live API calls.
-go run ./examples/extraction
-```
 
 For the sample document, the intended selections are `dana.personal@gmail.com`
 for the receipt and `dana.whit@acme-corp.com` for the sender. Actual selections and
 confidence values come from the model; the example handles a no-match result.
-Candidate-finder tests run locally without API access:
+
+## Examples
+
+Every example is a runnable program in its own package. All of them make real API
+requests and need `TYPESAFE_API_KEY`.
+
+| Example | Demonstrates |
+| --- | --- |
+| [`examples/basic`](examples/basic/main.go) | One `SystemOne` call with a Noul, Choice, and Score question |
+| [`examples/extraction`](examples/extraction/main.go) | Regex candidates plus `Pick` per role, with no-match handling |
+| [`examples/phone`](examples/phone/main.go) | `Pick` and `Classify` over one shared candidate list |
 
 ```sh
-go test ./examples/extraction
+# Each needs TYPESAFE_API_KEY and makes live calls.
+go run ./examples/basic
 ```
+
+The parts that can be checked offline are plain functions with their own tests:
+
+```sh
+go test ./examples/...   # candidate finders only; no API access
+```
+
+Runnable, offline godoc examples, including `*APIError` handling, live in
+[`example_test.go`](example_test.go) and appear on
+[pkg.go.dev](https://pkg.go.dev/github.com/RadixILS-Dev/typesafe-sdk-go).
 
 ## Retries and errors
 
@@ -190,9 +211,21 @@ logger or log request bodies, credentials, or headers.
 ## Development
 
 ```sh
+go build ./...        # library and examples
 go test -race ./...
 go vet ./...
+gofmt -l .            # must print nothing
+staticcheck ./...     # optional; CI runs it
 ```
 
-Tests use local servers and injected transports, not the live TypeSafe API.
-The example is compiled by the test command but is not run.
+Tests use local servers and injected transports, not the live TypeSafe API, so
+they pass offline and under `-race`. Only the programs under `examples/` make
+real requests, and only when you run them.
+
+CI (`.github/workflows/ci.yml`) runs all of the above on Go 1.26 and the latest
+stable release, checks that `go.mod` is tidy, and rejects a release tag whose
+name does not match the `Version` constant. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the release checklist,
+[`CHANGELOG.md`](CHANGELOG.md) for released changes, and
+[`SECURITY.md`](SECURITY.md) for reporting issues and credential guidance.
+
