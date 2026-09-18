@@ -2,11 +2,9 @@ package typesafe
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -26,9 +24,9 @@ func TestResponseValidation(t *testing.T) {
 		{`{"model":"m","usage":{},"answers":{"q":{"type":"noul","noul":"0.5"}}}`, "answers.q.noul"},
 		{`{"model":"m","usage":{},"answers":{"q":{"type":"choice","choice":"a","probabilities":{}}}}`, "answers.q.confidence"},
 		{`{"model":"m","usage":{},"answers":{"q":{"type":"choice","choice":"a","confidence":1,"probabilities":{"a":null}}}}`, "answers.q.probabilities.a"},
-		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{"x":"bad"},"probabilities":{}}}}`, "answers.q.legend"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{"x":"bad"},"probabilities":{}}}}`, "answers.q.legend.x"},
 		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{"0":null},"probabilities":{}}}}`, "answers.q.legend.0"},
-		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{},"probabilities":{"x":1}}}}`, "answers.q.probabilities"},
+		{`{"model":"m","usage":{},"answers":{"q":{"type":"score","score":0,"confidence":1,"legend":{},"probabilities":{"x":1}}}}`, "answers.q.probabilities.x"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.body, func(t *testing.T) {
@@ -37,13 +35,13 @@ func TestResponseValidation(t *testing.T) {
 				attempts.Add(1)
 				w.Header().Set("X-TypeSafe-Request-ID", "req-invalid")
 				fmt.Fprint(w, tc.body)
-			}, WithRetryPolicy(DefaultRetryPolicy()))
+			})
 			_, err := client.SystemOne(context.Background(), "x", Questions{"q": Noul{}})
-			var validation *ResponseValidationError
+			var validation *ResponseError
 			if !errors.As(err, &validation) {
 				t.Fatalf("got %T: %v", err, err)
 			}
-			if validation.FieldPath != tc.path || validation.StatusCode != 200 || validation.RequestID != "req-invalid" {
+			if validation.FieldPath != tc.path || validation.RequestID != "req-invalid" {
 				t.Fatalf("wrong validation error: %+v", validation)
 			}
 			if attempts.Load() != 1 {
@@ -63,15 +61,17 @@ func TestForwardCompatibleResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Answers) != 2 || result.Nouls["known"].Noul != 0 {
+	if len(result.RawAnswers) != 3 || len(result.Nouls) != 1 || len(result.Choices) != 0 || len(result.Scores) != 1 || result.Nouls["known"].Noul != 0 {
 		t.Fatal("unknown answer handling failed")
 	}
 	if result.Usage.InputTokens != nil || result.Usage.OutputTokens == nil || *result.Usage.OutputTokens != 0 {
 		t.Fatal("missing and zero token counts conflated")
 	}
-	if result.RequestID != "" || !strings.Contains(string(result.RawBody), `"unknown"`) {
+	if result.RequestID != "" {
 		t.Fatal("incorrect metadata")
 	}
+	jsonEqual(t, result.RawAnswers["unknown"], `{"type":"future","value":7}`)
+	jsonEqual(t, result.RawAnswers["known"], `{"type":"noul","noul":0,"future":true}`)
 	legend := result.Scores["score"].Legend[0].(map[string]any)
 	if len(legend["examples"].([]any)) != 2 {
 		t.Fatal("nested JSON lost")
@@ -83,10 +83,9 @@ func TestModelResponseValidation(t *testing.T) {
 		{`{}`, "models"}, {`{"models":null}`, "models"}, {`{"models":"bad"}`, "models"},
 		{`{"models":[{"name":"m","description":"d"}]}`, "models[0].release_date"},
 	} {
-		var result ListModelsResponse
-		err := json.Unmarshal([]byte(tc.body), &result)
-		var field *fieldError
-		if !errors.As(err, &field) || field.path != tc.path {
+		_, err := decodeModels([]byte(tc.body))
+		var field *ResponseError
+		if !errors.As(err, &field) || field.FieldPath != tc.path {
 			t.Fatalf("%s: unexpected error %v", tc.body, err)
 		}
 	}

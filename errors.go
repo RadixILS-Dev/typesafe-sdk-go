@@ -2,14 +2,14 @@ package typesafe
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 )
 
-// APIError describes an unsuccessful HTTP response. Use errors.As to inspect
-// this base type, including when the error has a more specific classification.
+// APIError describes an unsuccessful HTTP response. Use errors.As to inspect it
+// and StatusCode to distinguish authentication, rate limits, and other failures.
 type APIError struct {
 	StatusCode int
 	Body       any
@@ -30,53 +30,58 @@ func (e *APIError) Error() string {
 	return message
 }
 
-type BadRequestError struct{ *APIError }
-type AuthenticationError struct{ *APIError }
-type PermissionDeniedError struct{ *APIError }
-type NotFoundError struct{ *APIError }
-type UnprocessableEntityError struct{ *APIError }
-type InternalServerError struct{ *APIError }
-
-// RateLimitError includes the requested delay, when a valid retry header exists.
-type RateLimitError struct {
-	*APIError
-	RetryAfter    time.Duration
-	HasRetryAfter bool
-}
-
-// ResponseValidationError is a successful HTTP response with missing or
-// malformed required data. FieldPath locates the invalid field.
-type ResponseValidationError struct {
-	*APIError
+// ResponseError identifies missing or malformed required data in a successful
+// response. Err preserves the underlying JSON error when available.
+type ResponseError struct {
 	FieldPath string
+	RequestID string
+	Err       error
 }
 
-func (e *BadRequestError) Unwrap() error          { return e.APIError }
-func (e *AuthenticationError) Unwrap() error      { return e.APIError }
-func (e *PermissionDeniedError) Unwrap() error    { return e.APIError }
-func (e *NotFoundError) Unwrap() error            { return e.APIError }
-func (e *UnprocessableEntityError) Unwrap() error { return e.APIError }
-func (e *InternalServerError) Unwrap() error      { return e.APIError }
-func (e *RateLimitError) Unwrap() error           { return e.APIError }
-func (e *ResponseValidationError) Unwrap() error  { return e.APIError }
+func (e *ResponseError) Error() string {
+	message := fmt.Sprintf("typesafe: invalid response data at %q", e.FieldPath)
+	if e.Err != nil {
+		message += ": " + e.Err.Error()
+	}
+	if e.RequestID != "" {
+		message += " (request_id=" + e.RequestID + ")"
+	}
+	return message
+}
+func (e *ResponseError) Unwrap() error { return e.Err }
 
-// ConnectionError preserves the underlying transport or body-read failure.
-type ConnectionError struct{ Err error }
-
-func (e *ConnectionError) Error() string { return "typesafe: connection error: " + e.Err.Error() }
-func (e *ConnectionError) Unwrap() error { return e.Err }
-
-// TimeoutError is a per-attempt timeout, distinct from the caller's context
-// deadline. errors.Is and errors.As can inspect its underlying cause.
-type TimeoutError struct {
-	*ConnectionError
-	Timeout time.Duration
+func withRequestID(err error, requestID string) error {
+	var invalid *ResponseError
+	if errors.As(err, &invalid) {
+		invalid.RequestID = requestID
+	}
+	return err
 }
 
-func (e *TimeoutError) Error() string {
-	return fmt.Sprintf("typesafe: request timed out (timeout=%s)", e.Timeout)
+func newAPIError(response *http.Response, data []byte) *APIError {
+	body := decodeErrorBody(data)
+	message := errorMessage(body)
+	if message == "" {
+		if body == nil {
+			message = "status code (no body)"
+		} else {
+			message = strings.ToValidUTF8(string(data), "\uFFFD")
+			runes := []rune(message)
+			if len(runes) > 200 {
+				message = string(runes[:200]) + "…"
+			}
+		}
+	}
+	endpoint := ""
+	if response.Request != nil && response.Request.URL != nil {
+		u := *response.Request.URL
+		u.User, u.RawQuery, u.Fragment, u.RawFragment, u.ForceQuery = nil, "", "", "", false
+		endpoint = response.Request.Method + " " + u.String()
+	}
+	return &APIError{StatusCode: response.StatusCode, Body: body,
+		Headers: response.Header.Clone(), RequestID: response.Header.Get("X-TypeSafe-Request-ID"),
+		Endpoint: endpoint, Message: message}
 }
-func (e *TimeoutError) Unwrap() error { return e.ConnectionError }
 
 func decodeErrorBody(data []byte) any {
 	if len(data) == 0 {
@@ -97,106 +102,45 @@ func errorMessage(body any) string {
 	if !ok {
 		return ""
 	}
-	if s, ok := m["error"].(string); ok {
-		return s
-	}
-	if nested, ok := m["error"].(map[string]any); ok {
-		if s, ok := nested["message"].(string); ok {
-			return s
+	for _, key := range []string{"error", "message", "detail"} {
+		if text, ok := m[key].(string); ok {
+			return text
 		}
-	}
-	if s, ok := m["message"].(string); ok {
-		return s
-	}
-	if s, ok := m["detail"].(string); ok {
-		return s
-	}
-	if nested, ok := m["detail"].(map[string]any); ok {
-		if s, ok := nested["message"].(string); ok {
-			return s
+		if nested, ok := m[key].(map[string]any); ok {
+			if text, ok := nested["message"].(string); ok {
+				return text
+			}
 		}
 	}
 	if details, ok := m["detail"].([]any); ok {
-		var parts []string
-		for _, detail := range details {
-			entry, ok := detail.(map[string]any)
-			if !ok {
-				continue
-			}
-			message, ok := entry["msg"].(string)
-			if !ok {
-				continue
-			}
-			var path []string
-			if loc, ok := entry["loc"].([]any); ok {
-				for _, item := range loc {
-					if item == "body" {
-						continue
-					}
-					path = append(path, fmt.Sprint(item))
-				}
-			}
-			if len(path) > 0 {
-				message = strings.Join(path, ".") + ": " + message
-			}
-			parts = append(parts, message)
-		}
-		return strings.Join(parts, "; ")
+		return validationMessages(details)
 	}
 	return ""
 }
 
-func baseAPIError(response *http.Response, data []byte) *APIError {
-	body := decodeErrorBody(data)
-	message := errorMessage(body)
-	if message == "" {
-		if body == nil {
-			message = "status code (no body)"
-		} else {
-			message = strings.ToValidUTF8(string(data), "\uFFFD")
-			runes := []rune(message)
-			if len(runes) > 200 {
-				message = string(runes[:200]) + "…"
+func validationMessages(details []any) string {
+	var messages []string
+	for _, detail := range details {
+		entry, ok := detail.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := entry["msg"].(string)
+		if !ok {
+			continue
+		}
+		var path []string
+		if location, ok := entry["loc"].([]any); ok {
+			for _, item := range location {
+				if item != "body" {
+					path = append(path, fmt.Sprint(item))
+				}
 			}
 		}
-	}
-	endpoint := ""
-	if response.Request != nil {
-		u := *response.Request.URL
-		u.User, u.RawQuery, u.Fragment, u.RawFragment, u.ForceQuery = nil, "", "", "", false
-		endpoint = response.Request.Method + " " + u.String()
-	}
-	return &APIError{StatusCode: response.StatusCode, Body: body,
-		Headers: response.Header.Clone(), RequestID: response.Header.Get("X-TypeSafe-Request-ID"),
-		Endpoint: endpoint, Message: message}
-}
-
-func newAPIError(response *http.Response, data []byte) error {
-	e := baseAPIError(response, data)
-	switch e.StatusCode {
-	case 400:
-		return &BadRequestError{e}
-	case 401:
-		return &AuthenticationError{e}
-	case 403:
-		return &PermissionDeniedError{e}
-	case 404:
-		return &NotFoundError{e}
-	case 422:
-		return &UnprocessableEntityError{e}
-	case 429:
-		delay, ok := parseRetryAfter(e.Headers, time.Now())
-		return &RateLimitError{e, delay, ok}
-	default:
-		if e.StatusCode >= 500 {
-			return &InternalServerError{e}
+		if len(path) > 0 {
+			message = strings.Join(path, ".") + ": " + message
 		}
-		return e
+		messages = append(messages, message)
 	}
-}
-
-func responseValidationError(response *http.Response, data []byte, path string) error {
-	e := baseAPIError(response, data)
-	e.Message = fmt.Sprintf("invalid response data at %q", path)
-	return &ResponseValidationError{APIError: e, FieldPath: path}
+	return strings.Join(messages, "; ")
 }

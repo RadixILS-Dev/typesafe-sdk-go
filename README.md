@@ -1,25 +1,24 @@
 # TypeSafe AI Go SDK
 
-A Go client for [TypeSafe AI](https://typesafe.ai), following the behavior of the
-[Python SDK v0.6.0](https://github.com/typesafe-ai/typesafe-sdk-python/tree/420ef4ffb612d5a539a1e0f0fe883ff6770340af).
-Uses only the Go standard library.
+A client for [TypeSafe AI](https://typesafe.ai). The wire
+format and default retry behavior follow the
+[Python SDK v0.6.0](https://github.com/typesafe-ai/typesafe-sdk-python/tree/420ef4ffb612d5a539a1e0f0fe883ff6770340af),
+with a smaller, Go-native API.
 
 ## Quick start
 
 ```sh
-go get github.com/rocktavious/typesafe-sdk-go
+go get github.com/RadixILS-Dev/typesafe-sdk-go
 export TYPESAFE_API_KEY='your-api-key'
 ```
 
-The import path is `github.com/rocktavious/typesafe-sdk-go`; the package name is
-`typesafe`.
+Import `github.com/RadixILS-Dev/typesafe-sdk-go` as package `typesafe`:
 
 ```go
 client, err := typesafe.NewClient()
 if err != nil {
     log.Fatal(err)
 }
-
 ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 defer cancel()
 
@@ -40,140 +39,153 @@ if err != nil {
 fmt.Println(result.Nouls["billing"].Noul, result.Choices["tone"].Choice, result.Scores["urgency"].Score)
 ```
 
-See [`examples/basic/main.go`](examples/basic/main.go) for the complete program.
-Run it with `go run ./examples/basic` (makes a real API request).
+The complete program is in [`examples/basic/main.go`](examples/basic/main.go).
+`go run ./examples/basic` makes a real API request.
 
 ## Configuration
 
-Explicit options override environment variables, which override defaults.
-Whitespace-only environment values are ignored.
+`NewClient()` uses environment variables and defaults. For explicit settings:
 
-| Option | Environment variable | Default |
+```go
+client, err := typesafe.NewClient(
+    typesafe.WithAPIKey("your-api-key"),
+    typesafe.WithModel("jev-latest"),
+    typesafe.WithMaxAttempts(1), // No retries.
+)
+```
+
+`WithAPIKey`, `WithBaseURL`, and `WithModel` override `TYPESAFE_API_KEY`,
+`TYPESAFE_BASE_URL`, and `TYPESAFE_DEFAULT_MODEL`. Options apply in order; the last
+option for a setting wins. Blank environment values are ignored. The defaults
+are `https://api.typesafe.ai` and `jev-latest`; an API key is required.
+`WithMaxAttempts` accepts a positive total attempt count (default three).
+
+The default HTTP client has a 10-second timeout per attempt and does not follow
+redirects. Use `WithHTTPClient` to control timeouts, redirects, transport,
+or instrumentation. It is used **unchanged**, not copied, reconfigured, or closed;
+a supplied client with a zero timeout has no per-attempt timeout. Contexts bound
+the entire call, including retry waits. Clients are safe for concurrent calls;
+do not mutate a shared HTTP client or request data during use.
+
+## Questions and results
+
+`Questions` maps names to `Noul`, `Choice`, `Score`, or raw JSON objects. Typed
+questions add their own `type` tags. State, instructions, and descriptions can
+contain structured JSON. For example, `Choice.Criteria` accepts
+`map[string]any{"billing": nil}` and `Score.Criteria` accepts `[]any`.
+
+Nil optional fields are omitted; explicit empty strings remain empty strings,
+not JSON null. Raw question objects (`map[string]any`) are sent unchanged.
+The API validates question schemas, including empty questions and score rubrics.
+Serialization errors are returned before sending.
+
+Results contain `Nouls`, `Choices`, `Scores`, `Model`, `Usage`, and `RequestID`:
+
+- Noul: `Noul` is the probability of yes.
+- Choice: `Choice`, `Confidence`, and label-keyed `Probabilities`.
+- Score: `Score`, `Confidence`, and integer-keyed `Legend` and `Probabilities`.
+- Usage: `*int64` counts distinguish missing values from zero.
+
+`RawAnswers` retains every answer's original JSON, including unknown types and
+extra fields. Unknown types do not appear in the typed maps. Use normal Go map
+lookup checks when an answer may be absent. Missing or malformed required fields
+in known answers return an error instead of silently becoming zero values.
+
+Model listing is a direct call:
+
+```go
+models, err := client.ListModels(ctx)
+// models.Models contains Name, Description, and ReleaseDate.
+```
+
+## Convenience methods
+
+These helpers use `SystemOne`, including the client's model, retries, and context
+handling. Both state and instructions accept text or structured JSON.
+
+| Method | Purpose | Result |
 | --- | --- | --- |
-| `WithAPIKey` | `TYPESAFE_API_KEY` | Required |
-| `WithBaseURL` | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` |
-| `WithModel` | `TYPESAFE_DEFAULT_MODEL` | `jev-latest` |
-| `WithTimeout` | — | 10 seconds per HTTP attempt |
-
-Additional options: `WithHTTPClient`, `WithHeaders`, `WithRetryPolicy`, and
-`WithLogger` (a `*slog.Logger`). Clients can be reused concurrently. Supplied HTTP
-clients are not mutated or closed. Redirects are not followed.
-
-Per-call options are `WithRequestModel`, `WithRequestTimeout`,
-`WithRequestHeaders`, `WithRequestRetryPolicy`, and `WithExtraBody`. They do not
-modify the client's configuration. Extra body fields shallowly overwrite the
-System One body, including `state`, `model`, or `questions` if specified.
-Authentication and SDK identification headers cannot be overridden.
-
-## Questions and answers
-
-- **Noul:** returns a yes probability (`Noul`, from 0 to 1).
-- **Choice:** returns `Choice`, `Confidence`, and label-keyed `Probabilities`.
-- **Score:** returns a probability-weighted `Score`, `Confidence`, and
-  integer-keyed `Legend` and `Probabilities`. Levels start at zero.
-
-Question type tags are automatically serialized. State and instructions can be
-strings, JSON objects, or arrays. Criteria fields use `any` to support both simple
-Go containers and Python-compatible structured descriptions:
+| `Pick(ctx, state, instructions, candidates)` | Select a supplied span, or `typesafe.NoneChoice` (`"none"`) | `ChoiceAnswer, error` |
+| `Classify(ctx, state, instructions, options)` | Select from a fixed label set; no automatic fallback | `ChoiceAnswer, error` |
+| `IsTrue(ctx, state, instructions)` | Evaluate a yes/no question | `float64, error` — probability of yes |
 
 ```go
-question := typesafe.Choice{
-    Instructions: "Which team should handle this?",
-    Criteria: map[string]any{
-        "billing": map[string]any{"examples": []string{"charged twice", "refund"}},
-        "other": nil, // JSON null: no description
-    },
+document := "Invoice total: USD 42.00"
+
+picked, err := client.Pick(ctx, document, "Which amount is the invoice total?",
+    []string{"USD 42.00", "USD 21.00"})
+if err != nil {
+    log.Fatal(err)
 }
-```
+fmt.Println(picked.Choice, picked.Confidence)
 
-`Noul.Criteria` accepts `typesafe.NoulCriteria{"true": "Yes description",
-"false": "No description"}`. Structured score rubrics can use `[]any`.
-Empty strings remain empty strings; they are **not** rewritten as `null`.
-Nil optional fields are omitted; explicit empty strings, maps, and slices are
-preserved. A `RawQuestion` can express explicit nulls, extra fields, or future
-question types:
-
-```go
-questions := typesafe.Questions{
-    "custom": typesafe.RawQuestion{"type": "noul", "instructions": nil, "future_option": true},
+classified, err := client.Classify(ctx, document, "Which currency is used?",
+    []string{"USD", "EUR", "GBP"})
+if err != nil {
+    log.Fatal(err)
 }
-```
+fmt.Println(classified.Choice, classified.Confidence)
 
-Empty question maps and empty score rubrics are rejected before sending. Like
-Python, the SDK otherwise leaves detailed question validation to the API.
-
-Responses provide `Answers` plus grouped `Nouls`, `Choices`, and `Scores`. Groups
-share the same answer pointers. Unknown response fields are tolerated and unknown
-answer types are skipped; their original JSON remains in `RawBody`.
-
-`Model`, `Usage`, `RequestID`, and `RawHTTPResponse` expose response metadata.
-Token counts are `*int64`: nil means unreported, distinct from zero. Missing
-request IDs are empty strings. The original network body is closed before the
-call returns; `RawHTTPResponse.Body` is a buffered in-memory copy. Treat response
-maps and answers as read-only when sharing them between goroutines.
-
-## Models
-
-```go
-models, err := client.Models.List(ctx)
-// models.Models contains Name, Description, and ReleaseDate for each model.
-```
-
-## Retries and cancellation
-
-Defaults match Python: two retries after the initial attempt, retrying 408, 429,
-all 5xx statuses, connection failures, and per-attempt timeouts. Backoff starts at
-500 ms, doubles up to 5 seconds, and subtracts up to 25% jitter. `retry-after-ms`
-takes precedence over `Retry-After` (seconds or HTTP date).
-
-```go
-policy := typesafe.DefaultRetryPolicy()
-policy.MaxRetries = 3
-client, err := typesafe.NewClient(typesafe.WithRetryPolicy(policy))
-
-// Disable retries for one call:
-result, err := client.SystemOne(ctx, state, questions,
-    typesafe.WithRequestRetryPolicy(typesafe.RetryPolicy{}))
-```
-
-Policies replace the whole configuration; the zero-value policy disables retries.
-The default 30-second retry budget stops scheduling retries whose delays would
-reach or exceed the budget. It does not interrupt an in-flight attempt. Use a
-context deadline for a hard limit across attempts and waits. Caller cancellation
-is never retried. `RetryPolicy.Predicate` can add custom retry conditions.
-
-## Errors
-
-Use `errors.As` to inspect errors. Specific HTTP errors wrap `*typesafe.APIError`,
-which contains `StatusCode`, `Message`, `Body`, `Headers`, `Endpoint`, and
-`RequestID`:
-
-```go
-var apiErr *typesafe.APIError
-if errors.As(err, &apiErr) {
-    log.Printf("status=%d request_id=%s", apiErr.StatusCode, apiErr.RequestID)
+probability, err := client.IsTrue(ctx, document, "Does this state an invoice total?")
+if err != nil {
+    log.Fatal(err)
 }
+fmt.Println(probability)
 ```
 
-Specific types include `BadRequestError`, `AuthenticationError`,
-`PermissionDeniedError`, `NotFoundError`, `UnprocessableEntityError`,
-`RateLimitError`, and `InternalServerError`. `ResponseValidationError` identifies
-malformed successful responses using `FieldPath`. Transport failures use
-`ConnectionError` or `TimeoutError`, preserving the underlying cause for
-`errors.Is` / `errors.As`. Caller cancellation preserves `context.Canceled` or
-`context.DeadlineExceeded`.
+`Pick` does not extract candidate spans; the caller supplies them. Candidate text
+is preserved exactly, without trimming or normalization. The label `"none"` is
+reserved in `Pick`; passing it as a candidate returns an error. It is allowed as
+an ordinary label in `Classify`. Duplicate labels collapse into one option, just
+as they do in the Python cookbook's dictionaries. An empty candidate list still
+makes a request containing only the no-match option; an empty classification
+list is sent to the API for validation.
 
-## Deliberate Go adaptations
+Choice results also include `Probabilities`. A missing/wrong-type answer or a
+selection outside the supplied options returns `ResponseError`, not a silent
+zero value. `IsTrue` does not apply a threshold. These are single-question calls;
+use `SystemOne` when batching questions or accessing usage and raw responses.
 
-- One concurrency-safe client instead of separate sync/async clients.
-- Contexts and functional options instead of keyword arguments.
-- The 10-second timeout bounds a complete HTTP attempt, including reading its
-  body, rather than Python's individual HTTP operations. A supplied HTTP client's
-  positive timeout is inherited unless overridden; its own timeout still applies.
-- Explicit `WithLogger` rather than configuring global logging through an
-  environment variable. Logs contain metadata only, never headers or bodies.
-- Caller-owned HTTP resources are not closed; there is no required `Close` call.
-- Public responses are ordinary Go structs, not immutable Python objects.
+### Candidate extraction example
+
+[`examples/extraction/main.go`](examples/extraction/main.go) finds email addresses
+with a regex, deduplicates them in document order, and uses `Pick` to select the
+receipt destination and From address independently. It also includes phone and
+money patterns usable with the same candidate finder. Normalization stays in
+application code, after selection.
+
+```sh
+# Requires TYPESAFE_API_KEY; makes two live API calls.
+go run ./examples/extraction
+```
+
+For the sample document, the intended selections are `dana.personal@gmail.com`
+for the receipt and `dana.whit@acme-corp.com` for the sender. Actual selections and
+confidence values come from the model; the example handles a no-match result.
+Candidate-finder tests run locally without API access:
+
+```sh
+go test ./examples/extraction
+```
+
+## Retries and errors
+
+The client retries HTTP 408, 429, 5xx, and transport/read failures, up to
+the attempt limit set by `WithMaxAttempts`. Backoff starts at 500 ms, doubles up
+to 5 seconds, and subtracts
+up to 25% jitter. `retry-after-ms` takes precedence over `Retry-After` (seconds or
+HTTP date). A fixed 30-second scheduling budget prevents starting a retry whose
+delay would reach that budget; it does not interrupt an in-flight request.
+Use a context deadline for a hard limit. Caller cancellation is never retried.
+
+- `*APIError` exposes `StatusCode`, `Message`, `Body`, `Headers`, and `RequestID`.
+- `*ResponseError` identifies invalid response data by `FieldPath` and `RequestID`.
+- Transport and context errors preserve their native causes for `errors.Is` and
+  `errors.As`; inspect `net.Error` for transport timeouts.
+
+Errors are returned to the caller to handle or log. The SDK does not install a
+logger or log request bodies, credentials, or headers.
+
 
 ## Development
 
@@ -182,5 +194,5 @@ go test -race ./...
 go vet ./...
 ```
 
-Tests use local HTTP servers and injected transports; no API key or network
-access to TypeSafe is needed. The example is compiled by `go test ./...`, not run.
+Tests use local servers and injected transports, not the live TypeSafe API.
+The example is compiled by the test command but is not run.

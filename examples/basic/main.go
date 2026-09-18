@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/rocktavious/typesafe-sdk-go"
+	"github.com/RadixILS-Dev/typesafe-sdk-go"
 )
 
 func main() {
